@@ -183,7 +183,7 @@ def save_detection_results(results, frame, frame_number, segs_dir, model):
             "segmentations": segs_data
         }, f, indent=2)
     print(f"Saved {len(segs_data)} segmentation masks and images to {frame_img_dir}")
-    process_segs(segs_dir)
+    process_segs(segs_dir, frame_number)
 
     return len(segs_data)
 
@@ -242,7 +242,7 @@ def store_person_in_redis(person_name, embedding, metadata=None):
         return False
 
 
-def search_person_in_redis(query_embedding, similarity_threshold=0.93):
+def search_person_in_redis(query_embedding, similarity_threshold=0.90):
     global redis_client
 
     if redis_client is None:
@@ -363,24 +363,28 @@ def identify_and_store_persons(persons_to_process):
     print(f"\nFinished processing {len(persons_to_process)} person(s).\n")
 
 
-def process_segs(segs_dir):
-    """Process saved segmentation JSON files and identify persons."""
+def process_segs(segs_dir, specific_frame_number=None):
+    """Process saved segmentation JSON files and identify persons.
+
+    Args:
+        segs_dir: Directory containing segmentation data
+        specific_frame_number: If provided, only process this specific frame
+    """
     if not os.path.exists(segs_dir):
         print(f"Segmentation directory '{segs_dir}' does not exist.")
-        return
-
-    # Get all JSON files in the segs directory
-    json_files = sorted([f for f in os.listdir(segs_dir) if f.endswith('.json')])
-
-    if not json_files:
-        print(f"No JSON files found in '{segs_dir}'")
         return
 
     # Track if we found any persons to process
     persons_to_process = []
 
-    for json_file in json_files:
+    # If specific frame number provided, only process that one
+    if specific_frame_number is not None:
+        json_file = f"segs_frame_{specific_frame_number:06d}.json"
         json_path = os.path.join(segs_dir, json_file)
+
+        if not os.path.exists(json_path):
+            print(f"Frame {specific_frame_number} not found")
+            return
 
         with open(json_path, 'r') as f:
             data = json.load(f)
@@ -401,6 +405,36 @@ def process_segs(segs_dir):
                         'seg_info': seg,
                         'frame_number': frame_number
                     })
+    else:
+        # Process all JSON files (original behavior)
+        json_files = sorted([f for f in os.listdir(segs_dir) if f.endswith('.json')])
+
+        if not json_files:
+            print(f"No JSON files found in '{segs_dir}'")
+            return
+
+        for json_file in json_files:
+            json_path = os.path.join(segs_dir, json_file)
+
+            with open(json_path, 'r') as f:
+                data = json.load(f)
+
+            frame_number = data.get('frame', 0)
+            frame_dir = os.path.join(segs_dir, f"frame_{frame_number:06d}")
+
+            # Check each segmentation in the frame
+            for seg in data.get('segmentations', []):
+                if seg.get('class_name') == 'person':
+                    # Get the image path for this person
+                    image_file = seg.get('image_file')
+                    image_path = os.path.join(frame_dir, image_file)
+
+                    if os.path.exists(image_path):
+                        persons_to_process.append({
+                            'image_path': image_path,
+                            'seg_info': seg,
+                            'frame_number': frame_number
+                        })
 
     # Process all persons found
     identify_and_store_persons(persons_to_process)
@@ -410,7 +444,7 @@ def main():
     cap, model = setup_camera_and_model()
     setup_redis_and_embeddings()
     os.makedirs(SEGS_DIR, exist_ok=True)
-    delete_previous_segs(SEGS_DIR)
+    #delete_previous_segs(SEGS_DIR)
     window_name = setup_display(SEGS_DIR, window_size=WINDOW_SIZE)
 
     frame_count = 0
