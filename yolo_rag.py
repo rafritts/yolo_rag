@@ -18,6 +18,7 @@ MAX_DETECTIONS = 50
 SEGS_DIR = "tmp_segs"
 MODEL_PATH = "yolo11x-seg.pt"  # Segmentation model
 WINDOW_SIZE = (1280, 720)
+SAVE_SEGS_TO_DISK = False  # Toggle to save segmentation images/JSON to disk
 
 # Redis Configuration
 REDIS_HOST = "localhost"
@@ -138,7 +139,76 @@ def delete_previous_segs(segs_dir):
     return True
 
 
+def process_persons_from_results(results, frame, frame_number, model):
+    """Extract persons from results and process them for Redis."""
+    persons_to_process = []
+
+    # Only create temporary directory if saving to disk
+    if SAVE_SEGS_TO_DISK:
+        temp_dir = os.path.join(SEGS_DIR, "temp_persons")
+        os.makedirs(temp_dir, exist_ok=True)
+
+    person_idx = 0
+    for result in results:
+        # Check if masks exist (segmentation model)
+        if result.masks is None:
+            continue
+
+        boxes = result.boxes
+        masks = result.masks
+
+        for box, mask in zip(boxes, masks):
+            # Only process persons
+            class_id = int(box.cls.cpu())
+            class_name = model.names[class_id]
+
+            if class_name != 'person':
+                continue
+
+            # Get bounding box coordinates
+            coords = box.xyxy.cpu().tolist()[0]
+            x1, y1, x2, y2 = map(int, coords)
+
+            # Get binary mask and resize to original frame dimensions
+            mask_data = mask.data.cpu().numpy()[0]
+            mask_resized = cv2.resize(mask_data, (frame.shape[1], frame.shape[0]))
+            mask_binary = (mask_resized > 0.5).astype(np.uint8) * 255
+
+            # Create masked image (object with transparent/black background)
+            masked_frame = cv2.bitwise_and(frame, frame, mask=mask_binary.astype(np.uint8))
+            cropped_masked = masked_frame[y1:y2, x1:x2]
+
+            if cropped_masked.size > 0:
+                person_data = {
+                    'seg_info': {
+                        'confidence': float(box.conf.cpu()),
+                        'class_name': class_name
+                    },
+                    'frame_number': frame_number
+                }
+
+                if SAVE_SEGS_TO_DISK:
+                    # Save person image to disk
+                    temp_img_path = os.path.join(temp_dir, f"person_{frame_number:06d}_{person_idx:03d}.jpg")
+                    cv2.imwrite(temp_img_path, cropped_masked)
+                    person_data['image_path'] = temp_img_path
+                else:
+                    # Convert to PIL Image and keep in memory
+                    # OpenCV uses BGR, PIL uses RGB
+                    cropped_rgb = cv2.cvtColor(cropped_masked, cv2.COLOR_BGR2RGB)
+                    pil_image = Image.fromarray(cropped_rgb)
+                    person_data['image_data'] = pil_image
+
+                persons_to_process.append(person_data)
+                person_idx += 1
+
+    # Process all persons found
+    if persons_to_process:
+        identify_and_store_persons(persons_to_process)
+
+
 def save_detection_results(results, frame, frame_number, segs_dir, model):
+    """Save all detection results to disk (optional based on SAVE_SEGS_TO_DISK)."""
     segs_data = []
     frame_img_dir = os.path.join(segs_dir, f"frame_{frame_number:06d}")
     os.makedirs(frame_img_dir, exist_ok=True)
@@ -183,20 +253,28 @@ def save_detection_results(results, frame, frame_number, segs_dir, model):
             "segmentations": segs_data
         }, f, indent=2)
     print(f"Saved {len(segs_data)} segmentation masks and images to {frame_img_dir}")
-    process_segs(segs_dir, frame_number)
 
     return len(segs_data)
 
 
-def generate_embedding(image_path):
-    """Generate an embedding vector from an image file."""
+def generate_embedding(image_input):
+    """Generate an embedding vector from an image file path or PIL Image object.
+
+    Args:
+        image_input: Either a file path (str) or PIL Image object
+    """
     global embedding_model
 
     if embedding_model is None:
         raise RuntimeError("Embedding model not initialized")
 
-    # Load image using PIL
-    img = Image.open(image_path)
+    # Handle both file paths and PIL Image objects
+    if isinstance(image_input, str):
+        # It's a file path
+        img = Image.open(image_input)
+    else:
+        # It's already a PIL Image
+        img = image_input
 
     # Generate embedding
     embedding = embedding_model.encode(img)
@@ -306,12 +384,20 @@ def identify_and_store_persons(persons_to_process):
     print(f"\nFound {len(persons_to_process)} person(s) to process.")
 
     for idx, person_data in enumerate(persons_to_process, 1):
-        image_path = person_data['image_path']
         seg_info = person_data['seg_info']
 
-        # Check if image exists
-        if not os.path.exists(image_path):
-            print(f"Could not find image: {image_path}")
+        # Get image either from path or data
+        if 'image_path' in person_data:
+            image_path = person_data['image_path']
+            # Check if image exists
+            if not os.path.exists(image_path):
+                print(f"Could not find image: {image_path}")
+                continue
+            image_input = image_path
+        elif 'image_data' in person_data:
+            image_input = person_data['image_data']
+        else:
+            print(f"No image data available for person {idx}")
             continue
 
         print(f"\n[Person {idx}/{len(persons_to_process)}]")
@@ -320,7 +406,7 @@ def identify_and_store_persons(persons_to_process):
         try:
             # Generate embedding first for vector search
             print("Generating embedding...")
-            embedding = generate_embedding(image_path)
+            embedding = generate_embedding(image_input)
 
             # Search Redis for a match
             print("Searching for matches in database...")
@@ -339,8 +425,13 @@ def identify_and_store_persons(persons_to_process):
                     print("No previous persons in database.")
 
                 # Open and display the person image using PIL
-                person_img = Image.open(image_path)
-                print(f"Opening image in default viewer: {image_path}")
+                if isinstance(image_input, str):
+                    person_img = Image.open(image_input)
+                    print(f"Opening image in default viewer...")
+                else:
+                    person_img = image_input
+                    print(f"Opening image in default viewer...")
+
                 person_img.show(title=f"Who is this? ({idx}/{len(persons_to_process)})")
 
                 # Get person name from user input
@@ -350,9 +441,12 @@ def identify_and_store_persons(persons_to_process):
                     # Store in Redis with the user-provided name
                     metadata = {
                         'confidence': seg_info.get('confidence'),
-                        'frame_number': person_data['frame_number'],
-                        'image_path': image_path
+                        'frame_number': person_data['frame_number']
                     }
+                    # Only include image_path in metadata if it exists
+                    if 'image_path' in person_data:
+                        metadata['image_path'] = person_data['image_path']
+
                     store_person_in_redis(person_name, embedding, metadata)
                 else:
                     print("Skipped.")
@@ -475,7 +569,12 @@ def main():
         )
 
         if total_frame_count % SAVE_INTERVAL == 0:
-            save_detection_results(results, frame, total_frame_count, SEGS_DIR, model)
+            # Always process persons for Redis
+            process_persons_from_results(results, frame, total_frame_count, model)
+
+            # Optionally save all segmentation data to disk
+            if SAVE_SEGS_TO_DISK:
+                save_detection_results(results, frame, total_frame_count, SEGS_DIR, model)
 
         annotated_frame = annotate_frame(results, fps, total_frame_count)
 
