@@ -11,3 +11,8 @@ wheels/
 
 # All YOLO models
 yolo*.pt
+
+# Temporary boxes directory
+/tmp_boxes
+/tmp_boxes/*
+
