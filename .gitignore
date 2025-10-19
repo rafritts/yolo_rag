@@ -12,7 +12,7 @@ wheels/
 # All YOLO models
 yolo*.pt
 
-# Temporary boxes directory
-/tmp_boxes
-/tmp_boxes/*
+# Temporary segmentation masks directory
+/tmp_segs
+/tmp_segs/*
 

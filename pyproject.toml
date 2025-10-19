@@ -8,4 +8,7 @@ dependencies = [
     "numpy>=2.3.4",
     "torch>=2.9.0",
     "ultralytics>=8.3.217",
+    "redis>=5.2.1",
+    "sentence-transformers>=3.3.1",
+    "pillow>=11.2.0",
 ]
