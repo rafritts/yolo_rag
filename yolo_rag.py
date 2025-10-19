@@ -11,14 +11,15 @@ from sentence_transformers import SentenceTransformer
 
 
 # Configuration
-SAVE_INTERVAL = 60  # Save segmentation masks every N frames
-DETECTION_CONF = 0.50
+PROCESS_INTERVAL = 1  # Process segmentation masks every N frames
+DETECTION_CONF = 0.80
 DETECTION_IOU = 0.5
 MAX_DETECTIONS = 50
 SEGS_DIR = "tmp_segs"
 MODEL_PATH = "yolo11x-seg.pt"  # Segmentation model
 WINDOW_SIZE = (1280, 720)
 SAVE_SEGS_TO_DISK = False  # Toggle to save segmentation images/JSON to disk
+SHOW_PERSON_NAMES = True  # Toggle to show recognized person names on video feed
 
 # Redis Configuration
 REDIS_HOST = "localhost"
@@ -77,7 +78,7 @@ def setup_display(segs_dir, window_name="YOLO Segmentation", window_size=(1280, 
     cv2.resizeWindow(window_name, window_size[0], window_size[1])
 
     print("Press 'ctrl+c' to quit.")
-    print(f"Saving segmentation masks to '{segs_dir}' every {SAVE_INTERVAL} frames.")
+    print(f"Saving segmentation masks to '{segs_dir}' every {PROCESS_INTERVAL} frames.")
 
     return window_name
 
@@ -90,7 +91,67 @@ def update_fps(frame_count, start_time, elapsed_threshold=1.0):
     return None, frame_count, start_time
 
 
-def annotate_frame(results, fps, frame_count):
+def recognize_persons_in_frame(results, frame, model):
+    """Recognize persons in current frame and return their names/boxes."""
+    person_annotations = []
+
+    for result in results:
+        if result.boxes is None or result.masks is None:
+            continue
+
+        boxes = result.boxes
+        masks = result.masks
+
+        for box, mask in zip(boxes, masks):
+            # Only process persons
+            class_id = int(box.cls.cpu())
+            class_name = model.names[class_id]
+
+            if class_name != 'person':
+                continue
+
+            # Get bounding box coordinates
+            coords = box.xyxy.cpu().tolist()[0]
+            x1, y1, x2, y2 = map(int, coords)
+
+            # Get binary mask and extract person image
+            mask_data = mask.data.cpu().numpy()[0]
+            mask_resized = cv2.resize(mask_data, (frame.shape[1], frame.shape[0]))
+            mask_binary = (mask_resized > 0.5).astype(np.uint8) * 255
+
+            # Create masked image
+            masked_frame = cv2.bitwise_and(frame, frame, mask=mask_binary.astype(np.uint8))
+            cropped_masked = masked_frame[y1:y2, x1:x2]
+
+            if cropped_masked.size > 0:
+                try:
+                    # Convert to PIL Image for embedding
+                    cropped_rgb = cv2.cvtColor(cropped_masked, cv2.COLOR_BGR2RGB)
+                    pil_image = Image.fromarray(cropped_rgb)
+
+                    # Generate embedding and search
+                    embedding = generate_embedding(pil_image)
+                    matched_name, similarity = search_person_in_redis(embedding)
+
+                    person_annotations.append({
+                        'box': (x1, y1, x2, y2),
+                        'name': matched_name if matched_name else 'Unknown',
+                        'similarity': similarity,
+                        'confidence': float(box.conf.cpu())
+                    })
+                except Exception as e:
+                    # If recognition fails, mark as unknown
+                    person_annotations.append({
+                        'box': (x1, y1, x2, y2),
+                        'name': 'Unknown',
+                        'similarity': 0,
+                        'confidence': float(box.conf.cpu())
+                    })
+
+    return person_annotations
+
+
+def annotate_frame(results, fps, frame_count, person_annotations=None):
     annotated_frame = results[0].plot(
         line_width=2,
         font_size=1.0,
@@ -98,6 +159,7 @@ def annotate_frame(results, fps, frame_count):
         conf=True
     )
 
+    # Add FPS counter
     cv2.putText(
         annotated_frame,
         f"FPS: {fps:.1f} | Frame: {frame_count}",
@@ -107,6 +169,42 @@ def annotate_frame(results, fps, frame_count):
         (0, 255, 0),
         2
     )
+
+    # Overlay person names if provided
+    if person_annotations:
+        for person in person_annotations:
+            x1, y1, x2, y2 = person['box']
+            name = person['name']
+            similarity = person['similarity']
+
+            # Create label with name and similarity
+            if name != 'Unknown':
+                label = f"{name} ({similarity:.0%})"
+                color = (0, 255, 0)  # Green for recognized
+            else:
+                label = "Unknown"
+                color = (0, 165, 255)  # Orange for unknown
+
+            # Draw filled rectangle for text background
+            label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)
+            cv2.rectangle(
+                annotated_frame,
+                (x1, y1 - label_size[1] - 10),
+                (x1 + label_size[0] + 10, y1),
+                color,
+                -1
+            )
+
+            # Draw name text
+            cv2.putText(
+                annotated_frame,
+                label,
+                (x1 + 5, y1 - 5),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.9,
+                (0, 0, 0),  # Black text
+                2
+            )
 
     return annotated_frame
 
@@ -424,18 +522,33 @@ def identify_and_store_persons(persons_to_process):
                 else:
                     print("No previous persons in database.")
 
-                # Open and display the person image using PIL
+                # Convert image to OpenCV format for display
                 if isinstance(image_input, str):
-                    person_img = Image.open(image_input)
-                    print(f"Opening image in default viewer...")
+                    person_img_pil = Image.open(image_input)
                 else:
-                    person_img = image_input
-                    print(f"Opening image in default viewer...")
+                    person_img_pil = image_input
 
-                person_img.show(title=f"Who is this? ({idx}/{len(persons_to_process)})")
+                # Convert PIL to OpenCV (RGB to BGR)
+                person_img_cv = cv2.cvtColor(np.array(person_img_pil), cv2.COLOR_RGB2BGR)
+
+                # Display image in OpenCV window
+                window_id = f"Who is this? ({idx}/{len(persons_to_process)})"
+                cv2.namedWindow(window_id, cv2.WINDOW_NORMAL)
+                cv2.resizeWindow(window_id, 400, 600)
+                cv2.imshow(window_id, person_img_cv)
+
+                # Give the window time to render properly (multiple refresh cycles)
+                for _ in range(10):
+                    cv2.waitKey(50)  # Wait 50ms per iteration
+
+                print(f"Image displayed in window...")
 
                 # Get person name from user input
                 person_name = input("Enter person's name (or press Enter to skip): ").strip()
+
+                # Close the window immediately after input
+                cv2.destroyWindow(window_id)
+                cv2.waitKey(1)  # Ensure window is destroyed
 
                 if person_name:
                     # Store in Redis with the user-provided name
@@ -568,7 +681,7 @@ def main():
             verbose=False
         )
 
-        if total_frame_count % SAVE_INTERVAL == 0:
+        if total_frame_count % PROCESS_INTERVAL == 0:
             # Always process persons for Redis
             process_persons_from_results(results, frame, total_frame_count, model)
 
@@ -576,7 +689,12 @@ def main():
             if SAVE_SEGS_TO_DISK:
                 save_detection_results(results, frame, total_frame_count, SEGS_DIR, model)
 
-        annotated_frame = annotate_frame(results, fps, total_frame_count)
+        # Recognize persons in current frame for display (if enabled)
+        person_annotations = None
+        if SHOW_PERSON_NAMES:
+            person_annotations = recognize_persons_in_frame(results, frame, model)
+
+        annotated_frame = annotate_frame(results, fps, total_frame_count, person_annotations)
 
         cv2.imshow(window_name, annotated_frame)
 
