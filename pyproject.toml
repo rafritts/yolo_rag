@@ -1,0 +1,11 @@
+[project]
+name = "yolo-testing"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.3.4",
+    "torch>=2.9.0",
+    "ultralytics>=8.3.217",
+]
