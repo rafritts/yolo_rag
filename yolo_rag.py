@@ -8,6 +8,14 @@ import numpy as np
 import redis
 from PIL import Image
 from sentence_transformers import SentenceTransformer
+import logging
+
+# Configure logging
+logging.basicConfig(
+    level=logging.WARNING,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+log = logging.getLogger(__name__)
 
 
 # Configuration
@@ -59,16 +67,16 @@ def setup_redis_and_embeddings():
             decode_responses=False  # We'll store binary data
         )
         redis_client.ping()
-        print(f"Connected to Redis at {REDIS_HOST}:{REDIS_PORT}")
+        log.info(f"Connected to Redis at {REDIS_HOST}:{REDIS_PORT}")
     except redis.ConnectionError as e:
-        print(f"Warning: Could not connect to Redis: {e}")
-        print("Person embeddings will not be stored.")
+        log.warning(f"Could not connect to Redis: {e}")
+        log.warning("Person embeddings will not be stored.")
         redis_client = None
 
     # Initialize embedding model
-    print(f"Loading embedding model '{EMBEDDING_MODEL_NAME}'...")
+    log.info(f"Loading embedding model '{EMBEDDING_MODEL_NAME}'...")
     embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
-    print("Embedding model loaded successfully.")
+    log.info("Embedding model loaded successfully.")
 
     return redis_client, embedding_model
 
@@ -77,8 +85,8 @@ def setup_display(segs_dir, window_name="YOLO Segmentation", window_size=(1280, 
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, window_size[0], window_size[1])
 
-    print("Press 'ctrl+c' to quit.")
-    print(f"Saving segmentation masks to '{segs_dir}' every {PROCESS_INTERVAL} frames.")
+    log.info("Press 'ctrl+c' to quit.")
+    log.info(f"Saving segmentation masks to '{segs_dir}' every {PROCESS_INTERVAL} frames.")
 
     return window_name
 
@@ -229,10 +237,10 @@ def delete_previous_segs(segs_dir):
     if os.path.exists(segs_dir):
         try:
             shutil.rmtree(segs_dir)
-            print(f"Deleted previous segmentation masks from '{segs_dir}'")
+            log.debug(f"Deleted previous segmentation masks from '{segs_dir}'")
             return True
         except Exception as e:
-            print(f"Error deleting segmentation directory: {e}")
+            log.error(f"Error deleting segmentation directory: {e}")
             return False
     return True
 
@@ -350,7 +358,7 @@ def save_detection_results(results, frame, frame_number, segs_dir, model):
             "timestamp": time.time(),
             "segmentations": segs_data
         }, f, indent=2)
-    print(f"Saved {len(segs_data)} segmentation masks and images to {frame_img_dir}")
+    log.debug(f"Saved {len(segs_data)} segmentation masks and images to {frame_img_dir}")
 
     return len(segs_data)
 
@@ -385,7 +393,7 @@ def store_person_in_redis(person_name, embedding, metadata=None):
     global redis_client
 
     if redis_client is None:
-        print("Redis client not available. Cannot store person.")
+        log.warning("Redis client not available. Cannot store person.")
         return False
 
     try:
@@ -410,11 +418,11 @@ def store_person_in_redis(person_name, embedding, metadata=None):
         redis_client.hset(person_key, "embedding", embedding_bytes)
         redis_client.hset(person_key, "metadata", json.dumps(full_metadata))
 
-        print(f"Stored person '{person_name}' in Redis with key '{person_key}'")
+        log.info(f"Stored person '{person_name}' in Redis with key '{person_key}'")
         return True
 
     except Exception as e:
-        print(f"Error storing person in Redis: {e}")
+        log.error(f"Error storing person in Redis: {e}")
         return False
 
 
@@ -470,7 +478,7 @@ def search_person_in_redis(query_embedding, similarity_threshold=0.90):
             return None, best_similarity
 
     except Exception as e:
-        print(f"Error searching Redis: {e}")
+        log.error(f"Error searching Redis: {e}")
         return None, 0
 
 
@@ -479,7 +487,7 @@ def identify_and_store_persons(persons_to_process):
     if not persons_to_process:
         return
 
-    print(f"\nFound {len(persons_to_process)} person(s) to process.")
+    log.debug(f"\nFound {len(persons_to_process)} person(s) to process.")
 
     for idx, person_data in enumerate(persons_to_process, 1):
         seg_info = person_data['seg_info']
@@ -489,38 +497,38 @@ def identify_and_store_persons(persons_to_process):
             image_path = person_data['image_path']
             # Check if image exists
             if not os.path.exists(image_path):
-                print(f"Could not find image: {image_path}")
+                log.debug(f"Could not find image: {image_path}")
                 continue
             image_input = image_path
         elif 'image_data' in person_data:
             image_input = person_data['image_data']
         else:
-            print(f"No image data available for person {idx}")
+            log.debug(f"No image data available for person {idx}")
             continue
 
-        print(f"\n[Person {idx}/{len(persons_to_process)}]")
-        print(f"Frame: {person_data['frame_number']}")
+        log.debug(f"\n[Person {idx}/{len(persons_to_process)}]")
+        log.debug(f"Frame: {person_data['frame_number']}")
 
         try:
             # Generate embedding first for vector search
-            print("Generating embedding...")
+            log.debug("Generating embedding...")
             embedding = generate_embedding(image_input)
 
             # Search Redis for a match
-            print("Searching for matches in database...")
+            log.debug("Searching for matches in database...")
             matched_name, similarity = search_person_in_redis(embedding)
 
             if matched_name:
                 # Found a match!
-                print(f"✓ Recognized as '{matched_name}' (similarity: {similarity:.2%})")
-                print(f"Skipping identification prompt and storage.")
+                log.debug(f"✓ Recognized as '{matched_name}' (similarity: {similarity:.2%})")
+                log.debug(f"Skipping identification prompt and storage.")
 
             else:
                 # No match found - ask user to identify
                 if similarity > 0:
-                    print(f"No confident match found (best similarity: {similarity:.2%})")
+                    log.debug(f"No confident match found (best similarity: {similarity:.2%})")
                 else:
-                    print("No previous persons in database.")
+                    log.debug("No previous persons in database.")
 
                 # Convert image to OpenCV format for display
                 if isinstance(image_input, str):
@@ -541,7 +549,7 @@ def identify_and_store_persons(persons_to_process):
                 for _ in range(10):
                     cv2.waitKey(50)  # Wait 50ms per iteration
 
-                print(f"Image displayed in window...")
+                log.debug(f"Image displayed in window...")
 
                 # Get person name from user input
                 person_name = input("Enter person's name (or press Enter to skip): ").strip()
@@ -562,12 +570,12 @@ def identify_and_store_persons(persons_to_process):
 
                     store_person_in_redis(person_name, embedding, metadata)
                 else:
-                    print("Skipped.")
+                    log.debug("Skipped.")
 
         except Exception as e:
-            print(f"Error processing person: {e}")
+            log.error(f"Error processing person: {e}")
 
-    print(f"\nFinished processing {len(persons_to_process)} person(s).\n")
+    log.debug(f"\nFinished processing {len(persons_to_process)} person(s).\n")
 
 
 def process_segs(segs_dir, specific_frame_number=None):
@@ -578,7 +586,7 @@ def process_segs(segs_dir, specific_frame_number=None):
         specific_frame_number: If provided, only process this specific frame
     """
     if not os.path.exists(segs_dir):
-        print(f"Segmentation directory '{segs_dir}' does not exist.")
+        log.debug(f"Segmentation directory '{segs_dir}' does not exist.")
         return
 
     # Track if we found any persons to process
@@ -590,7 +598,7 @@ def process_segs(segs_dir, specific_frame_number=None):
         json_path = os.path.join(segs_dir, json_file)
 
         if not os.path.exists(json_path):
-            print(f"Frame {specific_frame_number} not found")
+            log.debug(f"Frame {specific_frame_number} not found")
             return
 
         with open(json_path, 'r') as f:
@@ -617,7 +625,7 @@ def process_segs(segs_dir, specific_frame_number=None):
         json_files = sorted([f for f in os.listdir(segs_dir) if f.endswith('.json')])
 
         if not json_files:
-            print(f"No JSON files found in '{segs_dir}'")
+            log.debug(f"No JSON files found in '{segs_dir}'")
             return
 
         for json_file in json_files:
@@ -663,7 +671,7 @@ def main():
         ret, frame = cap.read()
 
         if not ret:
-            print("Error: Failed to grab frame.")
+            log.error("Failed to grab frame.")
             break
 
         total_frame_count += 1
@@ -703,7 +711,7 @@ def main():
 
     cap.release()
     cv2.destroyAllWindows()
-    print("Program terminated.")
+    log.info("Program terminated.")
 
 
 if __name__ == "__main__":
