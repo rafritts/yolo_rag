@@ -19,7 +19,7 @@ log = logging.getLogger(__name__)
 
 
 # Configuration
-PROCESS_INTERVAL = 1  # Process segmentation masks every N frames
+PROCESS_INTERVAL = 60  # Process segmentation masks every N frames
 DETECTION_CONF = 0.80
 DETECTION_IOU = 0.5
 MAX_DETECTIONS = 50
